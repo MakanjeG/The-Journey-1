@@ -1520,6 +1520,17 @@ const sourceErr = {}; // name -> last error message, for diagnostics
 function setSourceStatus(name, ok, msg) {
   sourceOK[name] = ok;
   if (msg) sourceErr[name] = msg; else if (ok) delete sourceErr[name];
+  if (ok === true) {
+    // BUG FIX: the startup connectivity self-test only ran once, early, against a
+    // fixed pair of endpoints. If THAT happened to fail (slow proxy, transient
+    // blip) but the app went on to successfully load real data through a
+    // different path moments later, the "can't reach anything" banner stayed on
+    // screen indefinitely — actively contradicting the live prices right above it.
+    // Any confirmed successful fetch is proof the environment isn't blocked, so
+    // clear the banner the moment real data comes through.
+    const banner = document.getElementById('connectivityBanner');
+    if (banner) banner.style.display = 'none';
+  }
   const dot = document.getElementById('dot-' + name.toLowerCase().replace(/\W/g,'').replace('fear','fng').replace('gre','fng'));
   if (!dot) return;
   dot.className = 'dot ' + (ok===true?'green':ok===false?'red':'amber');
@@ -2480,7 +2491,10 @@ computeCalc();
 renderSymbolList();
 loadTickerSidebar();
 loadTapeWidgets();
-checkConnectivity();
+// Give the real symbol/tape fetches a few seconds to succeed first — only run the
+// heavier connectivity self-test if nothing has come through yet, so a slightly
+// slow-but-working proxy doesn't trigger a scary banner while data is already loading.
+setTimeout(() => { if (!Object.values(sourceOK).some(v => v === true)) checkConnectivity(); }, 4000);
 
 // restore last selection or default to BTC
 const lastSym = localStorage.getItem(LS.selected) || 'BTC/USD';
