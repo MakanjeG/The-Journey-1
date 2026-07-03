@@ -463,6 +463,8 @@
               <div class="muted" style="font-family:'JetBrains Mono',monospace; font-size:11px;" id="dAsOf">—</div>
             </div>
             <div class="desk-controls">
+              <button class="tf-btn" data-tf="1">1m</button>
+              <button class="tf-btn" data-tf="5">5m</button>
               <button class="tf-btn" data-tf="15">15m</button>
               <button class="tf-btn active" data-tf="60">1h</button>
               <button class="tf-btn" data-tf="240">4h</button>
@@ -1635,7 +1637,7 @@ async function checkConnectivity() {
 async function fetchCoinbaseCandles(product, granularitySec, limit=300) {
   // Coinbase Exchange candles. Valid granularities: 60, 300, 900, 3600, 21600, 86400.
   // For tf=240 (4h), 900 (15m daily), W, D — fetch 1h and aggregate locally.
-  const granularityMap = { '60':3600, '15':900 };
+  const granularityMap = { '1':60, '5':300, '15':900, '60':3600 };
   const g = granularityMap[tf] || 3600;
   const url = `https://api.exchange.coinbase.com/products/${product}/candles?granularity=${g}`;
   const data = await fetchJSON(url);
@@ -1662,8 +1664,11 @@ async function fetchYahooCandles(ysym, interval, range) {
   // Yahoo Finance chart endpoint — no CORS headers for browser calls, so this almost
   // always needs the proxy fallback inside fetchJSON. Falls back to Frankfurter daily
   // if Yahoo is unreachable even through the proxy.
-  const intervalMap = { '15':'60m', '60':'60m', '240':'60m', 'D':'1d', 'W':'1wk' };
-  const rangeMap    = { '15':'5d',  '60':'3mo', '240':'6mo', 'D':'2y', 'W':'5y' };
+  // BUG FIX: 15m used to silently request 60m candles from Yahoo (mislabeling hourly
+  // data as 15-minute) because Yahoo's 15m interval wasn't wired in at all. Now uses
+  // Yahoo's native 1m/5m/15m intervals directly for each of those buttons.
+  const intervalMap = { '1':'1m', '5':'5m', '15':'15m', '60':'60m', '240':'60m', 'D':'1d', 'W':'1wk' };
+  const rangeMap    = { '1':'1d',  '5':'5d', '15':'5d', '60':'3mo', '240':'6mo', 'D':'2y', 'W':'5y' };
   const intv = intervalMap[tf] || '60m';
   const rng  = rangeMap[tf] || '3mo';
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ysym)}?interval=${intv}&range=${rng}`;
@@ -1674,7 +1679,11 @@ async function fetchYahooCandles(ysym, interval, range) {
     const ts = r.timestamp;
     const ind = r.indicators.quote[0];
     const open = ind.open, high=ind.high, low=ind.low, close=ind.close, vol=ind.volume;
-    const group = (tf==='240' && intv==='60m') ? 4 : (tf==='W' ? 5 : 1);
+    // Only 4h needs local aggregation (Yahoo has no native 4h interval, so we combine
+    // 4x 60m candles). Every other timeframe now uses Yahoo's own matching interval
+    // directly — including Weekly, which was previously being re-aggregated 5-to-1 on
+    // top of Yahoo's already-weekly candles, silently turning "1W" into 5-week candles.
+    const group = (tf === '240' && intv === '60m') ? 4 : 1;
     const out=[];
     for (let i=0; i<ts.length; i+=group) {
       const slice = { o:[],h:[],l:[],c:[],v:[] };
@@ -1760,7 +1769,7 @@ async function fetchTwelveDataFXCandles(ysym, apiKey) {
   const m = ysym.match(/^([A-Z]{3})([A-Z]{3})=X$/);
   if (!m) throw new Error('unknown FX symbol ' + ysym);
   const [, base, quote] = m;
-  const intervalMap = { '15':'15min', '60':'1h', '240':'4h' };
+  const intervalMap = { '1':'1min', '5':'5min', '15':'15min', '60':'1h', '240':'4h' };
   const interval = intervalMap[tf] || '1h';
   const symbol = `${base}/${quote}`;
   const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=300&apikey=${encodeURIComponent(apiKey)}`;
@@ -1780,7 +1789,7 @@ async function fetchAlphaVantageFXCandles(ysym, apiKey) {
   const m = ysym.match(/^([A-Z]{3})([A-Z]{3})=X$/);
   if (!m) throw new Error('unknown FX symbol ' + ysym);
   const [, base, quote] = m;
-  const intervalMap = { '15':'15min', '60':'60min', '240':'60min' };
+  const intervalMap = { '1':'1min', '5':'5min', '15':'15min', '60':'60min', '240':'60min' };
   const interval = intervalMap[tf] || '60min';
   const url = `https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol=${base}&to_symbol=${quote}&interval=${interval}&outputsize=compact&apikey=${encodeURIComponent(apiKey)}`;
   const j = await fetchJSON(url, { allowProxy: false }); // AV sets its own CORS headers; proxying would burn quota on a wasted retry
@@ -2466,7 +2475,7 @@ async function loadTapeWidgets() {
   autoEvaluateChecklist();
 }
 
-function tfLabel(t) { return ({'15':'15m','60':'1h','240':'4h','D':'1D','W':'1W'})[t] || t; }
+function tfLabel(t) { return ({'1':'1m','5':'5m','15':'15m','60':'1h','240':'4h','D':'1D','W':'1W'})[t] || t; }
 function applyTfFilter(t) {
   tf = t;
   document.querySelectorAll('.tf-btn').forEach(b => b.classList.toggle('active', b.dataset.tf === t));
