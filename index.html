@@ -1637,17 +1637,23 @@ async function checkConnectivity() {
 
 async function fetchCoinbaseCandles(product, granularitySec, limit=300) {
   // Coinbase Exchange candles. Valid granularities: 60, 300, 900, 3600, 21600, 86400.
-  // For tf=240 (4h), 900 (15m daily), W, D — fetch 1h and aggregate locally.
-  const granularityMap = { '1':60, '5':300, '15':900, '60':3600 };
+  // BUG FIX: this used to always request 1h candles for Daily/Weekly views too, then
+  // aggregate locally — but Coinbase's API hard-caps every request at 300 candles
+  // regardless of granularity. Aggregating 300 hourly candles into daily buckets left
+  // only ~12 real daily candles (300÷24), and weekly buckets left just ONE (300÷168) —
+  // nowhere near enough for a 200-period EMA or even a 14-period RSI, which silently
+  // returned null and eventually crashed scoreConfluence outright. Fetching Daily
+  // granularity natively gives up to 300 REAL daily candles (~1 year), and Weekly now
+  // aggregates from that same real daily data (7-to-1) instead of hourly data
+  // (168-to-1) — roughly 40 real weekly candles instead of 1.
+  const granularityMap = { '1':60, '5':300, '15':900, '60':3600, '240':3600, 'D':86400, 'W':86400 };
   const g = granularityMap[tf] || 3600;
   const url = `https://api.exchange.coinbase.com/products/${product}/candles?granularity=${g}`;
   const data = await fetchJSON(url);
   // data: [[time, low, high, open, close, volume], ...] newest first
   let candles = data.slice(0, 800).reverse().map(r => ({ t:r[0]*1000, o:r[3], h:r[2], l:r[1], c:r[4], v:r[5] }));
-  // aggregate for non-1h timeframes
-  if (tf === '240') return aggregate(candles, 4);
-  if (tf === 'D')   return aggregate(candles, 24);
-  if (tf === 'W')   return aggregate(candles, 24*7);
+  if (tf === '240') return aggregate(candles, 4);  // native 1h -> group 4 = 4h
+  if (tf === 'W')   return aggregate(candles, 7);  // native 1D -> group 7 = 1W
   return candles.slice(-limit);
 }
 
@@ -2088,7 +2094,12 @@ function scoreConfluence(candles, ind, sym, extras) {
     push('200 EMA Trend', `${bullBias?'Above':'Below'} · ${diff.toFixed(2)}%`, diff > 0, 2);
   }
   // 2. RSI regime
-  const rsiLast = ind.rsi[ind.rsi.length-1];
+  // DEFENSIVE FIX: rsi() returns null when there's fewer than 15 candles (e.g. a
+  // symbol with very little history, or a data provider hiccup returning a short
+  // series). Previously this crashed the whole scoring function outright instead of
+  // just leaving this one factor out — same "not applicable" pattern as the other
+  // optional factors, rather than a hard failure.
+  const rsiLast = ind.rsi ? ind.rsi[ind.rsi.length-1] : null;
   if (Number.isFinite(rsiLast)) {
     const bull = rsiLast > 50 && rsiLast < 70, bear = rsiLast < 50 && rsiLast > 30;
     push('RSI Regime', `${rsiLast.toFixed(1)}${rsiLast>70?' (OB)':rsiLast<30?' (OS)':''}`, bull || bear, 2);
@@ -2415,6 +2426,7 @@ async function loadAll() {
   // (this was the root cause of a stale-symbol's price briefly appearing under a
   // different pair's row, with a nonsense % change computed against the wrong scale).
   const reqSym = current.sym, reqTf = tf, reqSrc = current.src;
+  const symbolChanged = current.sym !== candlesSymbol; // captured BEFORE candlesSymbol is overwritten below
   document.getElementById('chartLoading').classList.add('show');
   document.getElementById('chartLoadingMsg').textContent = `Loading ${reqSym} · ${tfLabel(reqTf)}…`;
   let data = [], src = reqSrc === 'coinbase' ? 'coinbase' : 'yahoo';
@@ -2440,26 +2452,49 @@ async function loadAll() {
   const dp = current.decimals ?? 2;
   const bullBias = lastIndicators.close > lastIndicators.ema200;
 
-  // Reset edge extras for the new symbol, then fill in whatever's cheap/synchronous
-  // right away (VWAP needs no extra network call — it's derived from candles already
-  // in hand) before kicking off the async ones (MTF, and OBI/Taker Flow for crypto).
-  lastExtras = { mtfAgree: null, vwapDev: estimateVwapDev(candles), obi: null, tbr: null };
+  // Reset edge extras for a genuinely new symbol. On a pure timeframe switch (same
+  // symbol), keep the previously-fetched OBI/Taker Flow values instead of wiping them
+  // to null — they're live snapshots, not timeframe-specific, so there's nothing stale
+  // about reusing them until the next real refresh.
+  lastExtras = {
+    mtfAgree: null, // always recomputed per timeframe (MTF's meaning depends on the current tf)
+    vwapDev: estimateVwapDev(candles), // cheap, always recomputed from the candles just loaded
+    obi: symbolChanged ? null : lastExtras.obi,
+    tbr: symbolChanged ? null : lastExtras.tbr
+  };
   rescoreAndRender(reqSym, reqTf, dp);
 
-  fetchDailyCandlesFor(current).then(daily => {
-    lastExtras.mtfAgree = computeMTF(daily, bullBias);
-    rescoreAndRender(reqSym, reqTf, dp);
-  }).catch(() => {}); // MTF is a bonus factor — a failed fetch just leaves it excluded, not an error state
+  // BUG FIX: this used to always fetch a separate daily-candle series for MTF
+  // comparison, even when the chart itself was ALREADY on Daily/Weekly — a wasted,
+  // fully redundant network call for identical data. It's also conceptually
+  // meaningless at that point: comparing "daily bias" against itself confirms
+  // nothing. MTF now only runs when there's an actual higher timeframe to check
+  // against (i.e. viewing something shorter than Daily).
+  if (reqTf !== 'D' && reqTf !== 'W') {
+    fetchDailyCandlesFor(current).then(daily => {
+      lastExtras.mtfAgree = computeMTF(daily, bullBias);
+      rescoreAndRender(reqSym, reqTf, dp);
+    }).catch(() => {}); // MTF is a bonus factor — a failed fetch just leaves it excluded, not an error state
+  }
 
   if (reqSrc === 'coinbase') {
-    fetchCoinbaseOrderBook(current.product).then(d => {
-      lastExtras.obi = computeOBI(d);
-      rescoreAndRender(reqSym, reqTf, dp);
-    }).catch(() => {});
-    fetchCoinbaseTrades(current.product).then(t => {
-      lastExtras.tbr = computeTBR(t);
-      rescoreAndRender(reqSym, reqTf, dp);
-    }).catch(() => {});
+    // BUG FIX: OBI/Taker Flow are live order-book/trade-tape snapshots — they don't
+    // depend on chart timeframe at all. Refetching them on every 1m→5m→1H switch on
+    // the SAME symbol was a wasted, fully redundant API call each time. Only refetch
+    // when the symbol itself actually changed; a pure timeframe switch just keeps
+    // whatever was already loaded (still refreshed periodically via the 60s tape timer).
+    if (symbolChanged || lastExtras.obi === null) {
+      fetchCoinbaseOrderBook(current.product).then(d => {
+        lastExtras.obi = computeOBI(d);
+        rescoreAndRender(reqSym, reqTf, dp);
+      }).catch(() => {});
+    }
+    if (symbolChanged || lastExtras.tbr === null) {
+      fetchCoinbaseTrades(current.product).then(t => {
+        lastExtras.tbr = computeTBR(t);
+        rescoreAndRender(reqSym, reqTf, dp);
+      }).catch(() => {});
+    }
   }
 
   // Update UI
