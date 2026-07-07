@@ -1028,7 +1028,7 @@ function buildAutoEvaluators() {
     return { ok: s === 'London' || s === 'NY', detail: `Current session: ${s}` };
   };
   M[slug('Last 3–5 candles named specifically')] = () => lastScore
-    ? { ok:true, detail: lastScore.factors.find(f=>f.name==='Last 5 Candles')?.val || '' }
+    ? { ok:true, detail: lastScore.factors.find(f=>f.name==='Momentum Confirmation')?.val || '' }
     : null;
   M[slug('Key levels — S/R, psychological, previous highs/lows')] = () => lastIndicators
     ? { ok: !!lastIndicators.keyLevelPrice, detail: lastIndicators.keyLevelPrice ? `${lastIndicators.keyLevelType} @ ${fmtPrice(lastIndicators.keyLevelPrice, current?.decimals??2)} (${lastIndicators.keyLevelDist.toFixed(1)}% away)` : 'No swing level found in range' }
@@ -1504,7 +1504,7 @@ let current = null;        // selected catalog entry
 let tf = '60';             // timeframe key (15, 60, 240, 'D', 'W')
 let candles = [];          // [{t,o,h,l,c,v}, ...]
 let candlesSymbol = null;    // which symbol `candles` actually belongs to
-let lastExtras = { mtfAgree: null, vwapDev: null, obi: null, tbr: null }; // async edge factors: MTF, VWAP, OBI, Taker Flow
+let lastExtras = { mtfAgree: null, vwapDev: null, obi: null, tbr: null, dxyCorr: null, meanRevZ: null, cmf: null }; // async edge factors
 let lastCandleSource = null; // 'coinbase' | 'yahoo' | 'frankfurter-daily' — what actually filled `candles`
 let lastIndicators = null; // computed indicators + verdict
 let lastScore = null;      // confluence score object
@@ -1852,6 +1852,37 @@ async function fetchFearGreed() {
   return { value: parseInt(j.data[0].value,10), classification: j.data[0].value_classification, ts: j.data[0].timestamp };
 }
 
+// Real multi-day DXY-basket history (EUR/USD + USD/JPY via Frankfurter), instead of
+// accumulating a trend live during the session. This matters specifically for 15m/1H
+// trading — a trend built from only the last few minutes of session data was too short
+// and noisy to mean anything at that speed; a real ~20-trading-day history gives a
+// genuine higher-timeframe USD-strength read regardless of what timeframe you're
+// actually trading. Cached for 4 hours since daily FX reference rates don't move
+// intraday anyway — no reason to refetch this on every symbol switch.
+let dxyHistoryCache = null;
+let dxyHistoryCacheTime = 0;
+const DXY_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+
+async function fetchDXYHistorySeries() {
+  if (dxyHistoryCache && (Date.now() - dxyHistoryCacheTime) < DXY_CACHE_TTL_MS) return dxyHistoryCache;
+  const end = new Date();
+  const start = new Date(end.getTime() - 35*86400000); // ~35 calendar days -> ~24 trading days
+  const fmt = d => d.toISOString().slice(0,10);
+  const [j1, j2] = await Promise.all([
+    fetchJSON(`https://api.frankfurter.dev/v1/${fmt(start)}..${fmt(end)}?base=EUR&symbols=USD`),
+    fetchJSON(`https://api.frankfurter.dev/v1/${fmt(start)}..${fmt(end)}?base=USD&symbols=JPY`)
+  ]);
+  const dates = Object.keys(j1.rates).filter(d => j2.rates[d]).sort();
+  const series = dates.map(d => {
+    const eurUsd = j1.rates[d].USD, usdJpy = j2.rates[d].JPY;
+    const value = (1/eurUsd * 0.5759 + 1/usdJpy * 0.1361) * 100;
+    return { date: d, value };
+  });
+  dxyHistoryCache = series;
+  dxyHistoryCacheTime = Date.now();
+  return series;
+}
+
 async function fetchDXYProxy() {
   // Use EUR/USD and USD/JPY to compute a DXY-like basket from Frankfurter (latest).
   const j1 = await fetchJSON('https://api.frankfurter.dev/v1/latest?base=EUR&symbols=USD');
@@ -1863,6 +1894,26 @@ async function fetchDXYProxy() {
   const jpyInv = 1 / usdJpy;
   const dxyProxy = (eurInv * 0.5759 + jpyInv * 0.1361) * 100; // normalized weight
   return { value: dxyProxy, eurUsd, usdJpy };
+}
+
+// Pure computation over an already-fetched DXY series: trend over the last N days,
+// AND a z-score of today's value vs its own recent mean (the statistical-deviation
+// read that feeds the mean-reversion entry-timing factor further down).
+function computeDxyCorrelation(series, ysym, trendDays=10) {
+  if (!series || series.length < 10) return null;
+  const m = ysym && ysym.match(/^([A-Z]{3})([A-Z]{3})=X$/);
+  if (!m) return null;
+  const [, base, quote] = m;
+  if (base !== 'USD' && quote !== 'USD') return null;
+  const recent = series.slice(-trendDays);
+  const first = recent[0].value, last = recent[recent.length-1].value;
+  const trendPct = (last - first) / first * 100;
+  const vals = series.map(s=>s.value);
+  const mean = vals.reduce((a,b)=>a+b,0)/vals.length;
+  const variance = vals.reduce((a,b)=>a+(b-mean)**2,0)/vals.length;
+  const stdev = Math.sqrt(variance);
+  const zScore = stdev>0 ? (last-mean)/stdev : 0;
+  return { trendPct, zScore, usdBase: base === 'USD' };
 }
 
 /* =====================================================
@@ -2008,6 +2059,52 @@ function atr(candles, n=14) {
   }
   return out;
 }
+
+// ===== Chaikin Money Flow (order-flow proxy) =====
+// A real, decades-old, named technical indicator — not a fabricated metric. It
+// approximates buying vs. selling PRESSURE from OHLCV alone (no true tick/trade data
+// needed, so it works identically for FX and crypto): each candle's close position
+// within its own high-low range tells you whether that candle closed nearer its highs
+// (buying pressure) or its lows (selling pressure), weighted by that candle's volume.
+// This is the honest, well-precedented way to approximate order flow without a real
+// order book — unlike a made-up "taker flow" proxy, CMF has 40+ years of documented use.
+function computeCMF(candles, period=20) {
+  if (candles.length < period) return null;
+  const recent = candles.slice(-period);
+  let sumMFV = 0, sumVol = 0;
+  for (const c of recent) {
+    const range = c.h - c.l;
+    if (range <= 0 || !c.v) continue;
+    const mfMultiplier = ((c.c - c.l) - (c.h - c.c)) / range; // -1..+1
+    sumMFV += mfMultiplier * c.v;
+    sumVol += c.v;
+  }
+  if (sumVol <= 0) return null; // no real volume data available for this symbol/period
+  return sumMFV / sumVol; // -1..+1, positive = net buying pressure
+}
+
+// ===== Mean-reversion Z-score (statistical entry-timing) =====
+// Standard Bollinger-Band-style statistic: how many standard deviations is the current
+// price from its own recent rolling mean. NOTE ON DESIGN: pure mean-reversion (fade
+// every extreme) is a genuinely different, often CONTRADICTORY paradigm to the
+// trend-following factors already in this scorer (200 EMA, Structure, Momentum). Rather
+// than bolt on a contradictory "fade the trend" signal, this is used as an ENTRY-TIMING
+// filter within the existing trend bias: in an uptrend, a good entry is a statistically
+// real pullback (z moderately negative) — not price already extended far above its mean
+// (chasing). The reverse for a downtrend. This is the coherent way to combine mean-
+// reversion statistics with a trend-following framework, rather than two systems arguing
+// with each other.
+function computeMeanReversionZ(candles, period=20) {
+  if (candles.length < period) return null;
+  const recent = candles.slice(-period).map(c=>c.c);
+  const mean = recent.reduce((a,b)=>a+b,0)/recent.length;
+  const variance = recent.reduce((a,b)=>a+(b-mean)**2,0)/recent.length;
+  const stdev = Math.sqrt(variance);
+  if (stdev <= 0) return null;
+  const last = candles[candles.length-1].c;
+  return (last - mean) / stdev;
+}
+
 function stochastic(candles, n=14, smoothK=3) {
   // Raw %K, then smoothed %K and %D (simple moving averages)
   const kRaw = [];
@@ -2081,7 +2178,7 @@ function scoreConfluence(candles, ind, sym, extras) {
   // A factor whose data isn't available/applicable yet is left OUT of scoring entirely
   // rather than counted as a fail — an FX pair should never be penalized for lacking
   // crypto-only order-book data, and a not-yet-loaded factor shouldn't look like a "no."
-  const ex = extras || { mtfAgree: null, vwapDev: null, obi: null, tbr: null };
+  const ex = extras || { mtfAgree: null, vwapDev: null, obi: null, tbr: null, dxyCorr: null };
   const factors = [];
   const push = (name, val, ok, weight) => factors.push({ name, val, ok, weight });
 
@@ -2093,40 +2190,99 @@ function scoreConfluence(candles, ind, sym, extras) {
     const diff = (last - ema200)/ema200 * 100;
     push('200 EMA Trend', `${bullBias?'Above':'Below'} · ${diff.toFixed(2)}%`, diff > 0, 2);
   }
-  // 2. RSI regime
-  // DEFENSIVE FIX: rsi() returns null when there's fewer than 15 candles (e.g. a
-  // symbol with very little history, or a data provider hiccup returning a short
-  // series). Previously this crashed the whole scoring function outright instead of
-  // just leaving this one factor out — same "not applicable" pattern as the other
-  // optional factors, rather than a hard failure.
+  // 2. Momentum Confirmation — CONSOLIDATED
+  // BUG FIX (design-level, not a crash): RSI Regime, MACD Momentum, and Last 5
+  // Candles were three SEPARATE weighted votes for what is, underneath, largely the
+  // same underlying thing — is there directional momentum right now. Counting all
+  // three independently let one real momentum signal masquerade as three pieces of
+  // confluence, inflating scores during genuine trends without adding new
+  // information. They're now folded into a single factor requiring a majority (2 of
+  // 3) of the underlying checks to agree, at a combined weight roughly equal to
+  // what one strong core factor should carry — not the sum of three.
   const rsiLast = ind.rsi ? ind.rsi[ind.rsi.length-1] : null;
-  if (Number.isFinite(rsiLast)) {
-    const bull = rsiLast > 50 && rsiLast < 70, bear = rsiLast < 50 && rsiLast > 30;
-    push('RSI Regime', `${rsiLast.toFixed(1)}${rsiLast>70?' (OB)':rsiLast<30?' (OS)':''}`, bull || bear, 2);
-  }
-  // 3. MACD momentum
+  const rsiBull = Number.isFinite(rsiLast) ? (rsiLast > 50 && rsiLast < 70) : null;
+  const rsiBear = Number.isFinite(rsiLast) ? (rsiLast < 50 && rsiLast > 30) : null;
   const hist = ind.macd.hist[ind.macd.hist.length-1];
   const histPrev = ind.macd.hist[ind.macd.hist.length-2];
-  if (Number.isFinite(hist)) {
-    const ok = (hist > 0 && hist > histPrev) || (hist < 0 && hist < histPrev);
-    push('MACD Momentum', hist>0?'Bullish':'Bearish', ok, 2);
+  const macdOk = Number.isFinite(hist) ? ((hist > 0 && hist > histPrev) || (hist < 0 && hist < histPrev)) : null;
+  const macdDirOk = Number.isFinite(hist) ? (bullBias ? hist > 0 : hist < 0) && macdOk : null;
+  const last5 = candles.slice(-5);
+  const ups5 = last5.filter((c,i)=> i>0 && c.c > candles[candles.length-5+i-1].c).length;
+  const downs5 = last5.length - 1 - ups5;
+  const last5Ok = bullBias ? (ups5 >= 3) : (downs5 >= 3);
+  const rsiDirOk = Number.isFinite(rsiLast) ? (bullBias ? rsiBull : rsiBear) : null;
+  const momentumChecks = [rsiDirOk, macdDirOk, last5Ok].filter(v => v !== null);
+  if (momentumChecks.length > 0) {
+    const passing = momentumChecks.filter(v => v).length;
+    const detail = `RSI ${Number.isFinite(rsiLast)?rsiLast.toFixed(1):'—'} · MACD ${Number.isFinite(hist)?(hist>0?'+':'')+hist.toFixed(4):'—'} · ${ups5}↑/${downs5}↓`;
+    push('Momentum Confirmation', `${passing}/${momentumChecks.length} agree · ${detail}`, passing >= Math.ceil(momentumChecks.length/2), 3);
   }
-  // 4. Market structure
-  // BUG FIX (kept from earlier): ind.structure is a string, not an object — use it directly.
+  // 3. Market structure
   const struct = ind.structure;
-  push('Market Structure', struct, struct !== 'RANGING', 2);
+  // BUG FIX: this used to pass whenever structure was "not RANGING" — meaning a
+  // bearish BOS DOWN would count as confluence FOR a bullish-biased trade, simply
+  // because something directional was happening at all. Confirmed on a real USD/JPY
+  // check: BOS DOWN was being scored as "aligned" toward a long, the same setup
+  // proposeSetup() correctly refused to generate because the two disagree. Now
+  // requires the structure's own direction to match the EMA-based bias.
+  const structDirOk = struct.includes(bullBias ? 'UP' : 'DOWN');
+  push('Market Structure', struct, structDirOk, 2);
   // 5. Key level proximity
   const dist = ind.keyLevelDist;
-  push('Key Level Proximity', dist < 1.5 ? `${dist.toFixed(1)}% from ${ind.keyLevelType}` : `Far (${dist.toFixed(1)}%)`, dist < 3, 2);
+  // BUG FIX: this used to pass for being near ANY key level, regardless of type —
+  // meaning sitting 0.5% under RESISTANCE counted as confluence FOR a long, when a
+  // nearby resistance is arguably a headwind for a long (limited room before a level
+  // that's capped price before), not a confirming signal. Support-for-long and
+  // resistance-for-short are the favorable pairings; the opposite is left as a fail.
+  const levelFavorable = bullBias ? ind.keyLevelType === 'support' : ind.keyLevelType === 'resistance';
+  push('Key Level Proximity', dist < 1.5 ? `${dist.toFixed(1)}% from ${ind.keyLevelType}` : `Far (${dist.toFixed(1)}%)`, dist < 3 && levelFavorable, 2);
   // 6. Multi-Timeframe Confluence — does the daily-timeframe trend agree with this setup's bias?
   // Same conviction tier as the other structural factors: knowing the higher timeframe
   // agrees is one of the more reliable forms of confluence there is.
   if (ex.mtfAgree !== null) {
     push('Multi-TF Confluence', ex.mtfAgree ? 'Daily trend agrees' : 'Daily trend disagrees', ex.mtfAgree, 2);
   }
+  // 7. DXY Correlation — genuinely independent information, not another momentum
+  // read on the same instrument. Now built from a REAL ~24-trading-day history
+  // (fetched and cached separately, see fetchDXYHistorySeries) instead of a live
+  // session accumulation — meaningful even on 15m/1H charts where a few minutes of
+  // session data would have been too short and noisy to call a trend from. If USD is
+  // the pair's quote currency (e.g. EUR/USD), a long should be confirmed by USD
+  // actually WEAKENING elsewhere (DXY trending down over the recent window). If USD
+  // is the base currency (e.g. USD/JPY), the polarity flips: a long is a bet on USD
+  // strength, so it should agree with DXY trending up.
+  const dxyCorr = ex.dxyCorr;
+  if (dxyCorr !== null && dxyCorr !== undefined) {
+    const dxyBullish = dxyCorr.usdBase ? dxyCorr.trendPct > 0 : dxyCorr.trendPct < 0;
+    const dxyOk = bullBias ? dxyBullish : !dxyBullish;
+    push('DXY Correlation', `USD ${dxyCorr.trendPct>=0?'+':''}${dxyCorr.trendPct.toFixed(2)}% /10d`, dxyOk, 2);
+  }
+  // 8. Order Flow (Chaikin Money Flow) — a real, ~40-year-old named indicator that
+  // approximates buy/sell pressure from OHLCV alone (works identically for FX and
+  // crypto, no L2 order book needed). Positive CMF = net buying pressure over the
+  // period; this should agree with the trade's bias, same logic as every other
+  // directional factor here.
+  const cmf = computeCMF(candles, 20);
+  if (cmf !== null) {
+    const cmfOk = bullBias ? cmf > 0.05 : cmf < -0.05;
+    push('Order Flow (CMF)', `${cmf>=0?'+':''}${cmf.toFixed(2)}`, cmfOk, 2);
+  }
+  // 9. Mean-Reversion Entry Timing — statistical (Bollinger-style) z-score, used as an
+  // ENTRY-TIMING filter WITHIN the existing trend bias rather than a contradictory
+  // "fade everything" signal: in an uptrend, a good entry is a real statistical
+  // pullback (z moderately negative, e.g. -2 to -0.3) — not price already extended
+  // far above its mean (chasing, z strongly positive). Mirrored for downtrends. This
+  // is the coherent way to combine mean-reversion math with trend-following instead
+  // of the two paradigms just contradicting each other.
+  const meanRevZ = computeMeanReversionZ(candles, 20);
+  if (meanRevZ !== null) {
+    const goodPullback = bullBias ? (meanRevZ < -0.3 && meanRevZ > -2.5) : (meanRevZ > 0.3 && meanRevZ < 2.5);
+    const chasing = bullBias ? meanRevZ > 1.5 : meanRevZ < -1.5;
+    push('Mean-Reversion Entry', `z=${meanRevZ.toFixed(2)}${chasing?' (extended)':goodPullback?' (pullback)':''}`, goodPullback, 1);
+  }
 
   // ===== SUPPORTING FACTORS (weight 1 each) =====
-  // 7. Volume confirm
+  // 10. Volume confirm
   const lastVol = candles[candles.length-1].v;
   const avgVol20 = candles.slice(-21,-1).reduce((a,c)=>a+c.v,0)/20;
   const volOk = lastVol > avgVol20*0.8;
@@ -2134,12 +2290,9 @@ function scoreConfluence(candles, ind, sym, extras) {
   // 8. ATR volatility check
   const atrRatio = ind.atrRatio;
   push('Volatility (ATR)', atrRatio>0.02?'Healthy':atrRatio>0.005?'Tight':'Choppy', atrRatio>0.005 && atrRatio<0.08, 1);
-  // 9. Last 3-5 candles pattern
-  const last5 = candles.slice(-5);
-  const ups = last5.filter((c,i)=> i>0 && c.c > candles[candles.length-5+i-1].c).length;
-  const down = last5.length - 1 - ups;
-  push('Last 5 Candles', `${ups} ↑ / ${down} ↓`, (ups >= 3) || (down >= 3), 1);
-  // 10. Session check
+  // (Last 5 Candles is now folded into "Momentum Confirmation" above, rather than
+  // scored as its own separate vote — see that block for the reasoning.)
+  // 9. Session check
   const session = currentSession();
   const sessOk = session === 'London' || session === 'NY';
   push('Trading Session', session + (sessOk?' (open)':' (avoid)'), sessOk, 1);
@@ -2415,6 +2568,15 @@ function rescoreAndRender(reqSym, reqTf, dp) {
     document.getElementById('sRr').textContent    = lastProposal.rr.toFixed(2) + 'R';
     document.getElementById('sRisk').textContent  = '1% (auto)';
     document.getElementById('sInv').textContent   = lastProposal.invalidation;
+  } else {
+    // BUG FIX: this used to do nothing when proposeSetup() returned null (e.g. when
+    // the EMA-trend bias and swing structure disagree, correctly refusing to propose
+    // a trade) — leaving whatever setup was last displayed frozen on screen, even if
+    // it belonged to a completely different symbol checked earlier in the session.
+    // A confirmed real case: EUR/USD's old LONG @ 1780ish stayed visible under
+    // USD/JPY's live ~161 indicators, looking like a current recommendation when it
+    // was stale garbage from an unrelated instrument. Hide it explicitly instead.
+    document.getElementById('setupCard').style.display = 'none';
   }
   autoEvaluateChecklist();
 }
@@ -2460,9 +2622,20 @@ async function loadAll() {
     mtfAgree: null, // always recomputed per timeframe (MTF's meaning depends on the current tf)
     vwapDev: estimateVwapDev(candles), // cheap, always recomputed from the candles just loaded
     obi: symbolChanged ? null : lastExtras.obi,
-    tbr: symbolChanged ? null : lastExtras.tbr
+    tbr: symbolChanged ? null : lastExtras.tbr,
+    dxyCorr: symbolChanged ? null : lastExtras.dxyCorr // real multi-day history, cached ~4hrs — no need to reset on a pure tf switch
   };
   rescoreAndRender(reqSym, reqTf, dp);
+
+  // DXY Correlation — only meaningful for FX pairs (getDxyCorrelation itself also
+  // gates on ysym matching a plain 3-letter/3-letter pair). fetchDXYHistorySeries()
+  // has its own internal 4-hour cache, so this is cheap to call on every FX load.
+  if (reqSrc !== 'coinbase' && current.ysym) {
+    fetchDXYHistorySeries().then(series => {
+      lastExtras.dxyCorr = computeDxyCorrelation(series, current.ysym);
+      rescoreAndRender(reqSym, reqTf, dp);
+    }).catch(() => {}); // bonus factor — a failed fetch just leaves it excluded
+  }
 
   // BUG FIX: this used to always fetch a separate daily-candle series for MTF
   // comparison, even when the chart itself was ALREADY on Daily/Weekly — a wasted,
