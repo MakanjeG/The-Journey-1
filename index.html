@@ -2188,7 +2188,21 @@ function scoreConfluence(candles, ind, sym, extras) {
   const bullBias = last > ema200;
   if (Number.isFinite(ema200)) {
     const diff = (last - ema200)/ema200 * 100;
-    push('200 EMA Trend', `${bullBias?'Above':'Below'} · ${diff.toFixed(2)}%`, diff > 0, 2);
+    // BUG FIX (serious, structural): this used to check `diff > 0` unconditionally.
+    // Since bullBias is ITSELF defined as `last > ema200` (i.e. diff > 0), this meant
+    // the factor ALWAYS passed for LONG setups (free 2 points every time) and ALWAYS
+    // FAILED for SHORT setups (automatic 2-point deficit every time), regardless of
+    // how strong or weak the actual trend was. Confirmed on real EUR/USD data: a
+    // clear, sustained downtrend still failed this factor simply because it was
+    // bearish. This is very likely why every signal in earlier backtests was LONG —
+    // SHORT setups never had a fair chance to reach the TRADE threshold. Making it
+    // naively "direction-aware" (bullBias ? diff>0 : diff<0) would be tautological
+    // and contribute zero information, since bullBias is derived from that exact
+    // sign. Instead this now measures trend STRENGTH — is price meaningfully away
+    // from its 200 EMA in the trade's direction, not just barely on the right side
+    // of it — which is real, non-tautological information for both directions.
+    const emaStrengthOk = Math.abs(diff) > 0.1;
+    push('200 EMA Trend', `${bullBias?'Above':'Below'} · ${diff.toFixed(2)}%`, emaStrengthOk, 2);
   }
   // 2. Momentum Confirmation — CONSOLIDATED
   // BUG FIX (design-level, not a crash): RSI Regime, MACD Momentum, and Last 5
